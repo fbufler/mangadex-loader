@@ -365,20 +365,23 @@ func (c *Client) compressToCBZ(tmpDirs []string, outPath string) error {
 	zipWriter := zip.NewWriter(cbzFile)
 	defer zipWriter.Close()
 
+	imageCounter := 1
 	for _, dir := range tmpDirs {
 		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
 			if !info.IsDir() {
-				relPath := filepath.Base(path)
 				file, err := os.Open(path)
 				if err != nil {
 					return err
 				}
 				defer file.Close()
 
-				writer, err := zipWriter.Create(relPath)
+				ext := filepath.Ext(path)
+				zipName := fmt.Sprintf("%04d%s", imageCounter, ext)
+
+				writer, err := zipWriter.Create(zipName)
 				if err != nil {
 					return err
 				}
@@ -386,6 +389,7 @@ func (c *Client) compressToCBZ(tmpDirs []string, outPath string) error {
 				if err != nil {
 					return err
 				}
+				imageCounter++
 			}
 			return nil
 		})
