@@ -29,6 +29,20 @@ var getCmd = &cobra.Command{
 		manga, _ := cmd.Flags().GetString("manga")
 		output, _ := cmd.Flags().GetString("output")
 		name, _ := cmd.Flags().GetString("name")
+		language, _ := cmd.Flags().GetString("language")
+		retries, _ := cmd.Flags().GetInt("retries")
+		volume, _ := cmd.Flags().GetString("volume")
+
+		mangaLanguage := mangadex.MangaLanguageEN
+		switch language {
+		case "en":
+			mangaLanguage = mangadex.MangaLanguageEN
+		case "de":
+			mangaLanguage = mangadex.MangaLanguageDE
+		default:
+			slog.Error("Unsupported language", "language", language)
+			return
+		}
 
 		apiUrl, err := url.Parse(mangadexAPIURL)
 		if err != nil {
@@ -40,8 +54,10 @@ var getCmd = &cobra.Command{
 			APIUrl:        apiUrl,
 			Timeout:       time.Second * 10,
 			MangaID:       manga,
-			MangaLanguage: mangadex.MangaLanguageEN,
+			MangaLanguage: mangaLanguage,
+			Retries:       retries,
 			Output:        output,
+			Volume:        volume,
 			Name:          name,
 			Logger:        slog.New(slog.NewTextHandler(os.Stdout, nil)),
 		}
@@ -63,6 +79,9 @@ func init() {
 	getCmd.Flags().StringP("manga", "m", "", "The Manga ID to download")
 	getCmd.Flags().StringP("output", "o", "", "The output directory to save the manga")
 	getCmd.Flags().StringP("name", "n", "", "The name of the manga to download")
+	getCmd.Flags().StringP("language", "l", "en", "The language of the manga to download, supported languages: en, de")
+	getCmd.Flags().IntP("retries", "r", 3, "Number of retries for failed downloads")
+	getCmd.Flags().StringP("volume", "v", "", "The volume of the manga to download")
 }
 
 func main() {

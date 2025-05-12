@@ -1,7 +1,7 @@
 package mangadex
 
 import (
-	"archive/zip"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/fbufler/mangadex/pkg/cbz"
 	"github.com/schollz/progressbar/v3"
 )
 
@@ -22,16 +23,22 @@ type MangaLanguage string
 const (
 	// MangaLanguageEN is the English language code
 	MangaLanguageEN MangaLanguage = "en"
+	// MangaLanguageDE is the German language code
+	MangaLanguageDE MangaLanguage = "de"
 )
+
+const RETRY_WAIT_TIME = 10 * time.Second
 
 type Config struct {
 	APIUrl        *url.URL
 	Timeout       time.Duration
+	Retries       int
 	MangaID       string
 	MangaLanguage MangaLanguage
 	Output        string
 	Name          string
 	Logger        *slog.Logger
+	Volume        string
 }
 
 type Client struct {
@@ -64,6 +71,9 @@ func New(config *Config) *Client {
 	}
 	httpClient := &http.Client{
 		Timeout: config.Timeout,
+		Transport: &http.Transport{
+			TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper),
+		},
 	}
 	return &Client{
 		Config:     config,
@@ -108,15 +118,11 @@ type ChapterMetadata struct {
 
 func (c *Client) fetchChapterMetadata(chapterID string) (*ChapterMetadata, error) {
 	apiURL := fmt.Sprintf("%s/chapter/%s", c.Config.APIUrl.String(), chapterID)
-	resp, err := c.HttpClient.Get(apiURL)
+	resp, err := c.makeRequest("GET", apiURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch chapter metadata: %w", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("chapter metadata API returned status %s", resp.Status)
-	}
 
 	var chapterResp struct {
 		Result string `json:"result"`
@@ -152,6 +158,10 @@ func (c *Client) groupChaptersByVolume(chapterIDs []string) (map[string][]string
 			return nil, err
 		}
 		safeVolume := safe(meta.Volume)
+		if c.Config.Volume != "" && safeVolume != c.Config.Volume {
+			c.logger.Info("Skipping chapter not in requested volume", "chapter", id, "volume", safeVolume)
+			continue
+		}
 		tmpDir, err := c.downloadChapterPages(id)
 		if err != nil {
 			return nil, err
@@ -174,11 +184,16 @@ func (c *Client) DownloadManga() error {
 	for volume, dirs := range volumeDirs {
 		filename := fmt.Sprintf("%s-volume-%s.cbz", c.Config.Name, volume)
 		outPath := filepath.Join(c.Config.Output, filename)
-		err := c.compressToCBZ(dirs, outPath)
+		err := c.compressVolumeToCBZ(volume, dirs, outPath)
 		if err != nil {
 			return fmt.Errorf("failed to compress volume %s: %w", volume, err)
 		}
 		c.logger.Info("Volume compressed", "volume", volume, "file", filename)
+		err = c.removeTempDirectories(dirs)
+		if err != nil {
+			return fmt.Errorf("failed to remove temp directories for volume %s: %w", volume, err)
+		}
+		c.logger.Info("Removed temp directories", "volume", volume)
 	}
 	return nil
 }
@@ -200,18 +215,18 @@ func (c *Client) GetChaptersByMangaID(mangaID, lang string) ([]string, error) {
 	offset := 0
 
 	for {
-		apiURL := fmt.Sprintf("%s/chapter?manga=%s&translatedLanguage[]=%s&limit=%d&offset=%d&order[chapter]=asc",
-			c.Config.APIUrl.String(), mangaID, lang, limit, offset)
-		resp, err := c.HttpClient.Get(apiURL)
+		volumeParam := ""
+		if c.Config.Volume != "" {
+			volumeParam = "&volume=" + url.QueryEscape(c.Config.Volume)
+		}
+		apiURL := fmt.Sprintf("%s/chapter?manga=%s&translatedLanguage[]=%s%s&limit=%d&offset=%d&order[chapter]=asc",
+			c.Config.APIUrl.String(), mangaID, lang, volumeParam, limit, offset)
+		resp, err := c.makeRequest("GET", apiURL, nil)
 
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch chapters: %w", err)
 		}
 		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("chapter API returned status %s", resp.Status)
-		}
 
 		var result ChapterListResponse
 
@@ -259,15 +274,11 @@ func (c *Client) getChapterImageData(chapterId string) (*ChapterImageData, error
 	c.logger.Debug("Fetching image list via At-Home API", "chapterId", chapterId)
 
 	apiURL := fmt.Sprintf("%s/at-home/server/%s", c.Config.APIUrl.String(), chapterId)
-	resp, err := c.HttpClient.Get(apiURL)
+	resp, err := c.makeRequest("GET", apiURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch at-home API: %w", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("at-home API returned status %s", resp.Status)
-	}
 
 	var result struct {
 		BaseURL string `json:"baseUrl"`
@@ -290,15 +301,11 @@ func (c *Client) getChapterImageData(chapterId string) (*ChapterImageData, error
 }
 
 func (c *Client) downloadImage(url, outputPath string) error {
-	resp, err := c.HttpClient.Get(url)
+	resp, err := c.makeRequest("GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to download image: %w", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("image fetch failed with status %s", resp.Status)
-	}
 
 	out, err := os.Create(outputPath)
 	if err != nil {
@@ -349,47 +356,24 @@ func (c *Client) downloadChapterPages(chapterId string) (string, error) {
 	return tmpDir, nil
 }
 
-func (c *Client) compressToCBZ(tmpDirs []string, outPath string) error {
-	err := c.ensureOutputDir()
+func (c *Client) compressVolumeToCBZ(volumeName string, chapterDirectories []string, outPath string) error {
+	c.logger.Debug("Compressing to CBZ", "volumeName", volumeName, "outPath", outPath)
+	cbzFile, err := cbz.Open(outPath, c.logger)
 	if err != nil {
-		return fmt.Errorf("failed to ensure output directory: %w", err)
+		return fmt.Errorf("failed to open CBZ file: %w", err)
 	}
-	c.logger.Debug("Compressing to CBZ", "tmpDirs", tmpDirs, "outPath", outPath)
 
-	cbzFile, err := os.Create(outPath)
-	if err != nil {
-		return err
-	}
-	defer cbzFile.Close()
-
-	zipWriter := zip.NewWriter(cbzFile)
-	defer zipWriter.Close()
-
-	imageCounter := 1
-	for _, dir := range tmpDirs {
-		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	for _, dir := range chapterDirectories {
+		err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
 			if !info.IsDir() {
 				file, err := os.Open(path)
 				if err != nil {
-					return err
+					return fmt.Errorf("failed to open file %s: %w", path, err)
 				}
-				defer file.Close()
-
-				ext := filepath.Ext(path)
-				zipName := fmt.Sprintf("%04d%s", imageCounter, ext)
-
-				writer, err := zipWriter.Create(zipName)
-				if err != nil {
-					return err
-				}
-				_, err = io.Copy(writer, file)
-				if err != nil {
-					return err
-				}
-				imageCounter++
+				cbzFile.Add(file)
 			}
 			return nil
 		})
@@ -397,17 +381,53 @@ func (c *Client) compressToCBZ(tmpDirs []string, outPath string) error {
 			return err
 		}
 	}
-
-	return nil
+	return cbzFile.Write(&cbz.WriteOptions{Order: true})
 }
 
-func (c *Client) ensureOutputDir() error {
-	c.logger.Debug("Ensuring output directory exists", "output", c.Config.Output)
-	if _, err := os.Stat(c.Config.Output); os.IsNotExist(err) {
-		err := os.MkdirAll(c.Config.Output, 0755)
+func (c *Client) removeTempDirectories(chapterDirectories []string) error {
+	for _, dir := range chapterDirectories {
+		err := os.RemoveAll(dir)
 		if err != nil {
-			return fmt.Errorf("failed to create output directory: %w", err)
+			return fmt.Errorf("failed to remove temp directory %s: %w", dir, err)
 		}
 	}
 	return nil
+}
+
+func (c *Client) makeRequest(method, url string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	c.logger.Debug("Making request", "method", method, "url", url)
+	resp, err := c.HttpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make request: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		// Handle rate limiting
+		if resp.StatusCode == http.StatusTooManyRequests {
+			c.logger.Warn("Rate limit reached, waiting 5 seconds")
+			time.Sleep(5 * time.Second)
+			return c.retryRequest(req, c.Config.Retries)
+		}
+		return nil, fmt.Errorf("request failed with status %s", resp.Status)
+	}
+	return resp, nil
+}
+
+func (c *Client) retryRequest(req *http.Request, maxRetries int) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+
+	for i := range maxRetries {
+		resp, err = c.HttpClient.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+		c.logger.Warn("Request failed, retrying", "attempt", i+1, "error", err)
+		time.Sleep(RETRY_WAIT_TIME)
+	}
+
+	return nil, fmt.Errorf("request failed after %d attempts: %w", maxRetries, err)
 }
